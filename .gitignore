@@ -1,0 +1,12 @@
+_build*
+build/
+*.o
+*.a
+*.so
+*.so.*
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.DS_Store
+*~

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "measure sub-frame time latency between two telemetry streams"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Estimate relative time offset (lag) between two telemetry streams using causal AR whitening and continuous timestamp refinement."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-latency <dira> <streama> <dirb> <streamb> <outdir> [options...]
+   or: milk-mlt-latency .dira=<da> .dirb=<db> .outdir=<out> ...
+
+Measure latency (tau > 0 => stream B lags behind stream A) via mlt.latency.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.latency -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.latency ${_q}"

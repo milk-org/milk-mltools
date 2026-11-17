@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "compute PCA modes and modal telemetry from FITS telemetry cubes"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Load paired telemetry cubes and compute spatial PCA modes, eigenvalues, and modal coefficient telemetry."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-pca <dir> <stream> <outdir> [nmodes] [method] [options...]
+   or: milk-mlt-pca .dir=<dir> .outdir=<out> [.nmodes=50] [.method=auto|cov|gram|rsvd] ...
+
+Compute PCA decomposition via mlt.pca.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.pca -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.pca ${_q}"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "check telemetry cubes, timing files, and two-stream overlap"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Validate paired .txt and .fits/.fits.fz telemetry cubes, reporting orphans, frame drops, jitter, and optional two-stream overlap."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-check <dir> [stream] [dir2] [stream2] [outreport]
+   or: milk-mlt-check .dir=<dir> [.stream=<s>] [.dir2=<d2>] [.stream2=<s2>] [.outreport=<file>]
+
+Check telemetry health and optional two-stream overlap via mlt.tlmcheck.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.tlmcheck -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.tlmcheck ${_q}"

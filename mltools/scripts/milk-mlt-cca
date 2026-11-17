@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "compute regularized Canonical Correlation Analysis (CCA) between two streams"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Align two telemetry streams and compute regularized PCA-subspace CCA with leak-free held-out temporal cross-validation."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-cca <dira> <streama> <dirb> <streamb> <outdir> [options...]
+   or: milk-mlt-cca .dira=<da> .dirb=<db> .outdir=<out> [.lag=auto|sec] ...
+
+Compute two-stream regularized CCA via mlt.cca.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.cca -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.cca ${_q}"
