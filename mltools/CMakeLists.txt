@@ -25,7 +25,8 @@ target_include_directories(
   ${LIBNAME}_objs PRIVATE "${CMAKE_SOURCE_DIR}/src"
                            "${CMAKE_SOURCE_DIR}/src/coremods")
 target_compile_options(
-  ${LIBNAME}_objs PRIVATE -O3 -fopenmp -fopenmp-simd -Wall -Wextra)
+  ${LIBNAME}_objs PRIVATE -O3 -fopenmp -fopenmp-simd -Wall -Wextra -Wformat=2
+                          -Wformat-overflow -Wformat-truncation)
 
 target_link_libraries(
   ${LIBNAME} PUBLIC OpenMP::OpenMP_C
@@ -40,3 +41,5 @@ add_test(NAME mlt-tlmindex-h1 COMMAND milk-fpsexec-mlt-tlmindex -h1)
 add_test(NAME mlt-tlmload-h1 COMMAND milk-fpsexec-mlt-tlmload -h1)
 add_test(NAME mlt-tlmsync-h1 COMMAND milk-fpsexec-mlt-tlmsync -h1)
 add_test(NAME mlt-tlmsave-h1 COMMAND milk-fpsexec-mlt-tlmsave -h1)
+add_test(NAME mlt-aoopt-h1 COMMAND milk-fpsexec-mlt-aoopt -h1)
+add_test(NAME mlt-psfrecon-h1 COMMAND milk-fpsexec-mlt-psfrecon -h1)

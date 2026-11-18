@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "reconstruct polychromatic AO PSF from modal telemetry and DM modes"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Reconstruct long-exposure polychromatic AO PSFs from modal residual telemetry, DM modes, optical gains, and Kolmogorov fitting halos."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-psfrecon <mval_dir_or_fits> <CMmodesDM.fits> <outdir> [stream] [method] ...
+   or: milk-mlt-psfrecon .mval=<dir> .modes_dm=<fits> .outdir=<out> [.lambda_um=1.65] ...
+
+Run polychromatic AO PSF reconstruction via mlt.psfr / mlt.psfrecon.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.psfr -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.psfr ${_q}"

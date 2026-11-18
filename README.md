@@ -21,6 +21,8 @@ Built in three thin layers that maximize reuse of existing `milk` infrastructure
 | C FPS | `mlt.tlmload` | Multi-threaded CFITSIO loader with time slicing, ROI, binning, pupil mask, and `(6, N)` `DOUBLE` timing image `<out>_t` |
 | C FPS | `mlt.tlmsync` | Align stream B onto stream A timestamps at lag $\tau$ (`linear`, `zoh`, `nearest`, `window`) |
 | C FPS | `mlt.tlmsave` | Write 2D `(P, N)` or 3D `(nx, ny, N)` image + `<in>_t` timing as `.fits` + 7-col `.txt` pair |
+| C FPS | `mlt.aoopt` | Closed-loop AO modal Welch PSDs, empirical ETFs, PyWFS optical gains, and stability-constrained optimal modal gains |
+| C FPS | `mlt.psfrecon` | Polychromatic AO PSF reconstruction (`hybrid`, `short_exp`, `otf`) from modal telemetry, DM modes, optical gains, and Kolmogorov fitting halos |
 | `@calc` C op | `mlt_xcov` | Normalized subspace or raw cross-covariance across `[-maxlag, +maxlag]` |
 | `@calc` C op | `mlt_arwhiten` | Fit pooled causal AR($p$) Levinson-Durbin filter on `X` and whiten both `X` and `Y` identically |
 | `@calc` C op | `mlt_arfilt1` | Single-input causal AR($p$) whitening filter |
@@ -33,6 +35,9 @@ Built in three thin layers that maximize reuse of existing `milk` infrastructure
 | Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.latency` / `milk-mlt-latency` | Modal PCA + AR($p$) whitening + coarse FFT/xcov + continuous timestamp scan (`lag > 0` $\iff B$ lags $A$) |
 | Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.cca` / `milk-mlt-cca` | Regularized PCA-subspace SVD-CCA with leak-free contiguous held-out temporal CV |
 | Bash (`mlt.*`) | `mlt.psd` | Welch one-sided PSD and optional two-stream magnitude-squared coherence + cross-phase |
+| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.aoloop` / `milk-mlt-aoopt` | Path-safe closed-loop modal PSD, optical gain, and optimal gain solver |
+| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.psfr` / `milk-mlt-psfrecon` | Path-safe polychromatic PSF reconstruction and Strehl/profile benchmark |
+| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.aotlm` / `milk-mlt-aotlm` | End-to-end telemetry health, dual-stage AO optimization, and Vis/NIR PSFR report (`TELEMETRY_REPORT.md`) |
 
 ## Quickstart
 

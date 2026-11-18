@@ -1482,3 +1482,328 @@ mlt.psd() {
     printf 'mlt.psd: N=%d seglen=%d nseg=%d fps=%s Hz -> %s\n' \
         "${__nv}" "${__sl}" "${__nseg}" "${__fps}" "${outdir}"
 }
+
+
+# Closed-loop AO modal PSD, ETF, optical-gain, and optimal integrator gain analysis
+mlt.aoloop() {
+    @args 'dir:str:telemetry directory or WFS modal FITS' \
+          'outdir:str:output directory' \
+          'loop:int=2:CACAO loop number (1 or 2)' \
+          'fs_hz:float=2000.0:loop sampling rate [Hz]' \
+          'latency_fr:float=2.0:total loop delay [frames]' \
+          'loopgain:float=0.35:fallback scalar loop gain' \
+          'loopmult:float=0.98:fallback scalar leak mult' \
+          'mgain:str=:optional per-mode gain FITS' \
+          'mmult:str=:optional per-mode leak FITS' \
+          'selfrm_cal:str=:optional calibration selfRM FITS' \
+          'selfrm_sky:str=:optional on-sky selfRM FITS' \
+          'est_ogain:int=0:estimate optical gain from DM steps if selfRM absent' \
+          'nseg:int=512:Welch FFT window length' \
+          'wfs_stream:str=:override WFS modeval stream name or FITS' \
+          'dm_stream:str=:override DM modeval stream name or FITS' \
+          'ol_stream:str=:override OL modeval stream name or FITS' \
+          'recompute_ol:int=1:recompute pseudo-OL modes from WFS+DM' -- "$@"
+
+    mkdir -p "${outdir}" || return 1
+    local -a __links=()
+    local __s_out __s_rep __m_wfs __m_dm __m_ol=""
+    local __s_mg="" __s_mm="" __s_cal="" __s_sky=""
+
+    __mlt_short_path __s_out "${outdir}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_outpath __s_rep "${outdir}/aoopt_summary.txt" __links || {
+        __mlt_cleanup __links; return 1
+    }
+
+    if [[ -d "${dir}" ]]; then
+        local __sdir __ws="${wfs_stream:-aol${loop}_modevalWFS}"
+        local __ds="${dm_stream:-aol${loop}_modevalDM}"
+        __mlt_short_path __sdir "${dir}" __links || { __mlt_cleanup __links; return 1; }
+        mlt.tlmload ".dir=${__sdir}" ".stream=${__ws}" ".out=@L:_mlt_awfs" ".packed=ON" >/dev/null || {
+            __mlt_rm_images _mlt_awfs _mlt_awfs_t; __mlt_cleanup __links; return 1
+        }
+        mlt.tlmload ".dir=${__sdir}" ".stream=${__ds}" ".out=@L:_mlt_adm" ".packed=ON" >/dev/null || {
+            __mlt_rm_images _mlt_awfs _mlt_awfs_t _mlt_adm _mlt_adm_t
+            __mlt_cleanup __links; return 1
+        }
+        __m_wfs="_mlt_awfs"
+        __m_dm="_mlt_adm"
+        if (( ! recompute_ol )) && [[ -n "${ol_stream}" ]]; then
+            if mlt.tlmload ".dir=${__sdir}" ".stream=${ol_stream}" \
+                ".out=@L:_mlt_aol" ".packed=ON" >/dev/null 2>&1; then
+                __m_ol="_mlt_aol"
+            fi
+        fi
+    else
+        __mlt_short_path __m_wfs "${wfs_stream:-${dir}}" __links || {
+            __mlt_cleanup __links; return 1
+        }
+        __mlt_short_path __m_dm "${dm_stream}" __links || { __mlt_cleanup __links; return 1; }
+        [[ -n "${ol_stream}" ]] && __mlt_short_path __m_ol "${ol_stream}" __links
+    fi
+
+    [[ -n "${mgain}" && -f "${mgain}" ]] && __mlt_short_path __s_mg "${mgain}" __links
+    [[ -n "${mmult}" && -f "${mmult}" ]] && __mlt_short_path __s_mm "${mmult}" __links
+    [[ -n "${selfrm_cal}" && -f "${selfrm_cal}" ]] && \
+        __mlt_short_path __s_cal "${selfrm_cal}" __links
+    [[ -n "${selfrm_sky}" && -f "${selfrm_sky}" ]] && \
+        __mlt_short_path __s_sky "${selfrm_sky}" __links
+
+    local __est_on="OFF" __rec_on="ON"
+    (( est_ogain )) && __est_on="ON"
+    (( ! recompute_ol )) && __rec_on="OFF"
+
+    local -a __cmd=(
+        mlt.aoopt
+        ".mval_wfs=${__m_wfs}"
+        ".mval_dm=${__m_dm}"
+        ".outdir=${__s_out}"
+        ".outreport=${__s_rep}"
+        ".fs_hz=${fs_hz}"
+        ".latency_fr=${latency_fr}"
+        ".loopgain=${loopgain}"
+        ".loopmult=${loopmult}"
+        ".est_ogain=${__est_on}"
+        ".recompute_ol=${__rec_on}"
+        ".nseg=${nseg}"
+    )
+    [[ -n "${__m_ol}" ]] && __cmd+=(".mval_ol=${__m_ol}")
+    [[ -n "${__s_mg}" ]] && __cmd+=(".mgain=${__s_mg}")
+    [[ -n "${__s_mm}" ]] && __cmd+=(".mmult=${__s_mm}")
+    [[ -n "${__s_cal}" ]] && __cmd+=(".selfrm_cal=${__s_cal}")
+    [[ -n "${__s_sky}" ]] && __cmd+=(".selfrm_sky=${__s_sky}")
+
+    "${__cmd[@]}"
+    local __rc=$?
+    __mlt_rm_images _mlt_awfs _mlt_awfs_t _mlt_adm _mlt_adm_t _mlt_aol _mlt_aol_t
+    __mlt_cleanup __links
+    return ${__rc}
+}
+
+# Polychromatic AO PSF reconstruction from modal residual telemetry & DM modes
+mlt.psfr() {
+    @args 'mval:str:telemetry directory or modal FITS' \
+          'modes_dm:str:CMmodesDM.fits path' \
+          'outdir:str:output directory' \
+          'stream:str=aol2_modevalWFS:modal stream prefix when mval is a dir' \
+          'method:str=hybrid:method (hybrid|short_exp|otf)' \
+          'lambda_um:float=1.65:central wavelength [um]' \
+          'bw_frac:float=0.18:fractional filter bandwidth' \
+          'nlambda:int=3:polychromatic slices' \
+          'pixscale_ld:float=2.50:detector pixels per lambda/D' \
+          'nwf:int=256:pupil grid size [pix]' \
+          'ncam:int=256:detector size [pix]' \
+          'tel_diam_m:float=8.2:telescope diameter [m]' \
+          'pup_diam:float=0.9375:clear pupil diameter fraction' \
+          'cobs:float=0.30:central obscuration ratio' \
+          'dm_diam:float=0.9986413:DM span fraction of nwf' \
+          'if_coupling:float=0.15:DM inter-actuator coupling' \
+          'opd_scale:float=2.0:OPD [um] per stroke unit' \
+          'seeing_arcsec:float=0.60:seeing FWHM @ 0.50 um [arcsec]' \
+          'pup:str=:optional 2D pupil amplitude FITS' \
+          'ncpa:str=:optional 2D static NCPA OPD [um] FITS' \
+          'ogain:str=:optional per-mode optical gain FITS' \
+          'ref_psf:str=:optional measured reference PSF FITS' \
+          'decim:int=1:temporal decimation stride (>=1)' \
+          'maxframes:int=0:max frames after decimation (0=all)' -- "$@"
+
+    mkdir -p "${outdir}" || return 1
+    local -a __links=()
+    local __s_out __s_rep __s_modes __m_in
+    local __s_pup="" __s_ncpa="" __s_og="" __s_ref=""
+
+    __mlt_short_path __s_out "${outdir}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_outpath __s_rep "${outdir}/psfrecon_summary.txt" __links || {
+        __mlt_cleanup __links; return 1
+    }
+    __mlt_short_path __s_modes "${modes_dm}" __links || { __mlt_cleanup __links; return 1; }
+
+    if [[ -d "${mval}" ]]; then
+        local __sdir
+        __mlt_short_path __sdir "${mval}" __links || { __mlt_cleanup __links; return 1; }
+        mlt.tlmload ".dir=${__sdir}" ".stream=${stream}" ".out=@L:_mlt_pmv" ".packed=ON" >/dev/null || {
+            __mlt_rm_images _mlt_pmv _mlt_pmv_t; __mlt_cleanup __links; return 1
+        }
+        __m_in="_mlt_pmv"
+    else
+        __mlt_short_path __m_in "${mval}" __links || { __mlt_cleanup __links; return 1; }
+    fi
+
+    [[ -n "${pup}" && -f "${pup}" ]] && __mlt_short_path __s_pup "${pup}" __links
+    [[ -n "${ncpa}" && -f "${ncpa}" ]] && __mlt_short_path __s_ncpa "${ncpa}" __links
+    [[ -n "${ogain}" && -f "${ogain}" ]] && __mlt_short_path __s_og "${ogain}" __links
+    [[ -n "${ref_psf}" && -f "${ref_psf}" ]] && __mlt_short_path __s_ref "${ref_psf}" __links
+
+    local -a __cmd=(
+        mlt.psfrecon
+        ".mval=${__m_in}"
+        ".modes_dm=${__s_modes}"
+        ".outdir=${__s_out}"
+        ".outreport=${__s_rep}"
+        ".method=${method}"
+        ".lambda_um=${lambda_um}"
+        ".bw_frac=${bw_frac}"
+        ".nlambda=${nlambda}"
+        ".pixscale_ld=${pixscale_ld}"
+        ".nwf=${nwf}"
+        ".ncam=${ncam}"
+        ".tel_diam_m=${tel_diam_m}"
+        ".pup_diam=${pup_diam}"
+        ".cobs=${cobs}"
+        ".dm_diam=${dm_diam}"
+        ".if_coupling=${if_coupling}"
+        ".opd_scale=${opd_scale}"
+        ".seeing_arcsec=${seeing_arcsec}"
+        ".decim=${decim}"
+        ".maxframes=${maxframes}"
+    )
+    [[ -n "${__s_pup}" ]] && __cmd+=(".pup=${__s_pup}")
+    [[ -n "${__s_ncpa}" ]] && __cmd+=(".ncpa=${__s_ncpa}")
+    [[ -n "${__s_og}" ]] && __cmd+=(".ogain=${__s_og}")
+    [[ -n "${__s_ref}" ]] && __cmd+=(".ref_psf=${__s_ref}")
+
+    "${__cmd[@]}"
+    local __rc=$?
+    __mlt_rm_images _mlt_pmv _mlt_pmv_t
+    __mlt_cleanup __links
+    return ${__rc}
+}
+
+# End-to-end telemetry health, dual-stage AO optimization, & Vis/NIR PSF reconstruction suite
+mlt.aotlm() {
+    @args 'tlmdir:str:telemetry directory containing cubes and telemetry_manifest.env' \
+          'outdir:str=:output analysis directory (default <tlmdir>/analysis)' \
+          'decim_psf:int=4:temporal decimation for short-exposure PSFR (>=1)' -- "$@"
+
+    if [[ ! -d "${tlmdir}" ]]; then
+        echo "mlt.aotlm: directory not found: ${tlmdir}" >&2
+        return 1
+    fi
+    local __out="${outdir:-${tlmdir}/analysis}"
+    mkdir -p "${__out}" || return 1
+
+    local TLM_SEEING="0.60" TLM_TEL_DIAM="8.2" TLM_NWF="256" TLM_PUP_DIAM="0.9375"
+    local TLM_COBS="0.30" TLM_FS1="1000.0" TLM_FS2="2000.0"
+    local TLM_LAT1="2.5" TLM_LAT2="2.0" TLM_GAIN1="0.35" TLM_GAIN2="0.35"
+    local TLM_MULT1="0.98" TLM_MULT2="0.98"
+    local TLM_DM2_DIAM="0.9986413" TLM_DM2_COUPL="0.15"
+    local TLM_STREAMS="csim_wfs_nir csim_wfs_vis aol1_dmC aol2_dmC dm01disp dm02disp"
+    TLM_STREAMS+=" aol1_modevalWFS aol1_modevalDM aol1_modevalOL"
+    TLM_STREAMS+=" aol2_modevalWFS aol2_modevalDM aol2_modevalOL"
+    TLM_STREAMS+=" psf_vis_final psf_nir_final"
+    local TLM_PUP_FITS="" TLM_STG1_CALIB="" TLM_STG2_CALIB="" TLM_PARENT_OUT=""
+
+    if [[ -f "${tlmdir}/telemetry_manifest.env" ]]; then
+        # shellcheck disable=SC1090
+        source "${tlmdir}/telemetry_manifest.env"
+    fi
+    [[ -z "${TLM_STG1_CALIB}" ]] && TLM_STG1_CALIB="${tlmdir}/calib_stg1"
+    [[ -z "${TLM_STG2_CALIB}" ]] && TLM_STG2_CALIB="${tlmdir}/calib_stg2"
+    [[ -z "${TLM_PARENT_OUT}" ]] && TLM_PARENT_OUT="$(dirname "${tlmdir}")"
+    [[ -z "${TLM_PUP_FITS}" && -f "${tlmdir}/csim_pup.fits" ]] && \
+        TLM_PUP_FITS="${tlmdir}/csim_pup.fits"
+
+    local __rep="${__out}/TELEMETRY_REPORT.md"
+    {
+        echo "# Closed-Loop Telemetry, AO Optimization & PSF Reconstruction Report"
+        echo ""
+        echo "- **Telemetry Directory**: \`${tlmdir}\`"
+        echo "- **Seeing**: \`${TLM_SEEING}\"\` @ 0.50 um | **Telescope**: \`${TLM_TEL_DIAM} m\`"
+        echo ""
+        echo "## 1. Captured Stream Health (\`mlt.tlmindex\`)"
+        echo ""
+        echo "| Stream | Cubes | Frames | Rate [Hz] | Jitter [us] | Dropped |"
+        echo "| :--- | ---: | ---: | ---: | ---: | ---: |"
+    } > "${__rep}"
+
+    local __s
+    for __s in ${TLM_STREAMS}; do
+        local -A __kv=()
+        if __mlt_run_tlmindex "${tlmdir}" "${__s}" __kv 2>/dev/null; then
+            printf '| `%s` | %s | %s | %s | %s | %s |\n' \
+                "${__s}" "${__kv[ncubes]}" "${__kv[nframes]}" "${__kv[fps]}" \
+                "${__kv[jitter_us]}" "${__kv[ndropped]}" >> "${__rep}"
+        fi
+    done
+
+    {
+        echo ""
+        echo "## 2. Modal Loop Diagnostics & Gain Optimization (\`mlt.aoopt\`)"
+        echo ""
+        echo "| Stage | Modes | Frames | OL RMS | Curr RMS | Opt RMS | Pred Var Red. | Mean Opt. Gain | 0-dB BW [Hz] | Dom. Peak [Hz] |"
+        echo "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    } >> "${__rep}"
+
+    local __stg
+    for __stg in 1 2; do
+        local __fs="${TLM_FS1}" __lat="${TLM_LAT1}" __gn="${TLM_GAIN1}" __ml="${TLM_MULT1}"
+        local __cdir="${TLM_STG1_CALIB}" __lbl="Stage 1 (AO3k)"
+        if (( __stg == 2 )); then
+            __fs="${TLM_FS2}"; __lat="${TLM_LAT2}"; __gn="${TLM_GAIN2}"; __ml="${TLM_MULT2}"
+            __cdir="${TLM_STG2_CALIB}"; __lbl="Stage 2 (SCExAO)"
+        fi
+        local __so="${__out}/aoopt_stg${__stg}"
+        local __mg="${TLM_PARENT_OUT}/aol${__stg}_mgain.fits"
+        local __sc="${TLM_PARENT_OUT}/selfRM_calib_stg${__stg}.fits"
+        local __ss="${TLM_PARENT_OUT}/selfRM_onsky_stg${__stg}.fits"
+        [[ ! -f "${__sc}" && -f "${__cdir}/selfRM_calib.fits" ]] && \
+            __sc="${__cdir}/selfRM_calib.fits"
+
+        local __est_step=1
+        [[ -f "${__sc}" && -f "${__ss}" ]] && __est_step=0
+        if mlt.aoloop "${tlmdir}" "${__so}" "${__stg}" "${__fs}" "${__lat}" "${__gn}" "${__ml}" \
+            "${__mg}" "" "${__sc}" "${__ss}" "${__est_step}" 512; then
+            local -A __ak=()
+            __mlt_read_kv "${__so}/aoopt_summary.txt" __ak
+            printf '| %s | %s | %s | %s | %s | %s | %s%% | %s | %s | %s |\n' \
+                "${__lbl}" "${__ak[nmodes]}" "${__ak[nframes]}" "${__ak[rms_ol]}" \
+                "${__ak[rms_curr]}" "${__ak[rms_opt]}" "${__ak[var_red_pct]}" \
+                "${__ak[mean_ogain]}" "${__ak[median_bw_hz]}" "${__ak[dom_vib_hz]}" >> "${__rep}"
+        fi
+    done
+
+    local __cm2="${TLM_STG2_CALIB}/CMmodesDM.fits"
+    if [[ -f "${__cm2}" ]]; then
+        {
+            echo ""
+            echo "## 3. Telemetry PSF Reconstruction (\`mlt.psfrecon\`)"
+            echo ""
+            echo "| Band | Optical Gain | Method | SR Recon | SR Ctrl | SR Meas | |dSR| | 2D Corr | In-Band [nm] | Fitting [nm] |"
+            echo "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        } >> "${__rep}"
+
+        local __og_file="${__out}/aoopt_stg2/ogain_est.fits"
+        local __bspec
+        for __bspec in "vis:0.75:0.15:2.20:Visible (0.75 um)" \
+                       "nir:1.65:0.18:2.50:Near-IR H (1.65 um)"; do
+            local __btag __lam __bw __ps __blbl
+            IFS=':' read -r __btag __lam __bw __ps __blbl <<< "${__bspec}"
+            local __ref="${TLM_PARENT_OUT}/psf_${__btag}_final.fits"
+            local __og_mode
+            for __og_mode in "unit" "calibrated"; do
+                local __og_arg="" __og_lbl="Unity (1.0)"
+                if [[ "${__og_mode}" == "calibrated" ]]; then
+                    [[ ! -f "${__og_file}" ]] && continue
+                    __og_arg="${__og_file}"
+                    __og_lbl="selfRM/aoopt"
+                fi
+                local __po="${__out}/psfr_${__btag}_${__og_mode}"
+                if mlt.psfr "${tlmdir}" "${__cm2}" "${__po}" "aol2_modevalWFS" "hybrid" \
+                    "${__lam}" "${__bw}" 3 "${__ps}" "${TLM_NWF}" 256 "${TLM_TEL_DIAM}" \
+                    "${TLM_PUP_DIAM}" "${TLM_COBS}" "${TLM_DM2_DIAM}" "${TLM_DM2_COUPL}" 2.0 \
+                    "${TLM_SEEING}" "${TLM_PUP_FITS}" "" "${__og_arg}" "${__ref}" \
+                    "${decim_psf}" 0; then
+                    local -A __pk=()
+                    __mlt_read_kv "${__po}/psfrecon_summary.txt" __pk
+                    printf '| %s | %s | `%s` | %s | %s | %s | %s | %s | %s | %s |\n' \
+                        "${__blbl}" "${__og_lbl}" "${__pk[method]}" "${__pk[sr_recon]}" \
+                        "${__pk[sr_ctrl]}" "${__pk[sr_meas]}" "${__pk[sr_abs_err]}" \
+                        "${__pk[corr_2d]}" "${__pk[inband_rms_nm]}" \
+                        "${__pk[fitting_rms_nm]}" >> "${__rep}"
+                fi
+            done
+        done
+    fi
+
+    echo "mlt.aotlm: report written -> ${__rep}"
+    return 0
+}

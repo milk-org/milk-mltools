@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "analyze closed-loop AO modal PSDs, ETFs, optical gains, and optimal modal gains"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Load closed-loop WFS and DM modal telemetry and compute Welch PSDs, empirical ETFs, optical gains, and variance-optimal modal gains."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-aoopt <dir> <outdir> [loop] [fs_hz] [latency_fr] [loopgain] [loopmult] ...
+   or: milk-mlt-aoopt .dir=<dir> .outdir=<out> [.loop=2] [.fs_hz=2000] [.latency_fr=2.0] ...
+
+Run closed-loop modal PSD & controller optimization via mlt.aoloop / mlt.aoopt.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.aoloop -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.aoloop ${_q}"

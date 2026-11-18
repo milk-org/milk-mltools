@@ -380,3 +380,199 @@ def test_psd_and_coherence(tmp_path, milk_env):
     df = fps / 512.0
     assert abs(freqs[ipk] - f_tone) <= df + 0.5, f"Peak freq {freqs[ipk]} != {f_tone}"
     assert coh[ipk] > 0.85, f"Coherence at tone bin = {coh[ipk]}"
+
+
+
+def test_aoopt_modal_psd_and_gain_optimizer(tmp_path, milk_env):
+    """Verify mlt.aoopt / milk-mlt-aoopt recovers selfRM optical gains, vibration peak, & optimal gains."""
+    rng = np.random.default_rng(2026)
+    n = 4096
+    fs = 2000.0
+    nmodes = 4
+    og_true = np.array([0.65, 0.75, 0.80, 0.85], dtype=np.float32)
+    g_curr = np.array([0.06, 0.72, 0.45, 0.45], dtype=np.float32)
+    alpha = 0.98
+
+    t = np.arange(n, dtype=np.float64) / fs
+    turb = np.zeros((n, nmodes), dtype=np.float64)
+    # Mode 0: strong AR(1) turbulence + 62.5 Hz vibration
+    e0 = rng.normal(0.0, 0.12, size=n)
+    for k in range(1, n):
+        turb[k, 0] = 0.992 * turb[k - 1, 0] + e0[k]
+    turb[:, 0] += 0.35 * np.sin(2.0 * np.pi * 62.5 * t)
+    # Mode 1: moderate AR(1) turbulence (over-gained at g=0.72)
+    e1 = rng.normal(0.0, 0.08, size=n)
+    for k in range(1, n):
+        turb[k, 1] = 0.985 * turb[k - 1, 1] + e1[k]
+    # Modes 2, 3: negligible turbulence, pure WFS noise -> optimal gain ~ 0
+
+    noise = np.column_stack(
+        [
+            rng.normal(0.0, 0.015, size=n),
+            rng.normal(0.0, 0.015, size=n),
+            rng.normal(0.0, 0.25, size=n),
+            rng.normal(0.0, 0.25, size=n),
+        ]
+    )
+
+    m_wfs = np.zeros((n, nmodes), dtype=np.float32)
+    m_dm = np.zeros((n, nmodes), dtype=np.float32)
+    for k in range(2, n):
+        res_sky = turb[k] + m_dm[k - 2]
+        m_wfs[k] = (og_true * res_sky + noise[k]).astype(np.float32)
+        m_dm[k] = (alpha * m_dm[k - 1] - g_curr * m_wfs[k]).astype(np.float32)
+
+    sdir = tmp_path / "aoopt_tlm"
+    odir = tmp_path / "aoopt_out"
+    write_synthetic_cube(sdir, "aol2_modevalWFS", m_wfs[:, None, :], t, fs)
+    write_synthetic_cube(sdir, "aol2_modevalDM", m_dm[:, None, :], t, fs)
+
+    fits.writeto(sdir / "mgain.fits", g_curr[None, :], overwrite=True)
+    srm_cal = np.zeros((6, nmodes, nmodes), dtype=np.float32)
+    srm_sky = np.zeros((6, nmodes, nmodes), dtype=np.float32)
+    for m in range(nmodes):
+        srm_cal[3, m, m] = 1.0
+        srm_sky[3, m, m] = og_true[m]
+    fits.writeto(sdir / "selfRM_cal.fits", srm_cal, overwrite=True)
+    fits.writeto(sdir / "selfRM_sky.fits", srm_sky, overwrite=True)
+
+    wrapper = MILK_INSTALLDIR / "bin" / "milk-mlt-aoopt"
+    res = subprocess.run(
+        [
+            str(wrapper),
+            str(sdir),
+            str(odir),
+            "2",
+            str(fs),
+            "2.0",
+            "0.35",
+            str(alpha),
+            str(sdir / "mgain.fits"),
+            "",
+            str(sdir / "selfRM_cal.fits"),
+            str(sdir / "selfRM_sky.fits"),
+            "0",
+            "512",
+        ],
+        env=milk_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+
+    kv = parse_kv(odir / "aoopt_summary.txt")
+    assert int(kv["nmodes"]) == nmodes
+    assert abs(float(kv["dom_vib_hz"]) - 62.5) <= (fs / 512.0) + 0.5
+    assert float(kv["var_red_pct"]) > 15.0
+
+    og_est = fits.getdata(odir / "ogain_est.fits").ravel()
+    np.testing.assert_allclose(og_est, og_true, atol=1e-3)
+
+    g_opt = fits.getdata(odir / "opt_mgain.fits").ravel()
+    assert g_opt[0] > 0.18, f"Under-gained mode 0 should increase gain: {g_opt}"
+    assert g_opt[1] < 0.65 and g_opt[1] < g_curr[1], (
+        f"Over-gained mode 1 should reduce gain to stability margin: {g_opt}"
+    )
+    assert g_opt[2] < 0.08 and g_opt[3] < 0.08, f"Noise modes should suppress gain: {g_opt}"
+
+
+def test_psfrecon_strehl_and_profile(tmp_path, milk_env):
+    """Verify mlt.psfrecon / milk-mlt-psfrecon matches exact polychromatic MFT PSF."""
+    rng = np.random.default_rng(99)
+    nwf = 64
+    ncam = 64
+    nmodes = 3
+    nt = 240
+    lam0 = 1.65
+    pixscale_ld = 2.5
+
+    yy, xx = np.indices((nwf, nwf), dtype=np.float32)
+    ctr = 0.5 * (nwf - 1.0)
+    rr = np.hypot(xx - ctr, yy - ctr) / (0.5 * 0.9375 * nwf)
+    pup = ((rr <= 1.0) & (rr >= 0.30)).astype(np.float32)
+
+    # Define 3 smooth modes directly on the [nwf x nwf] pupil grid (opd_scale = 2.0)
+    ux = (xx - ctr) / (0.5 * 0.9375 * nwf)
+    uy = (yy - ctr) / (0.5 * 0.9375 * nwf)
+    modes = np.stack(
+        [
+            0.5 * ux * pup,
+            0.5 * uy * pup,
+            0.5 * (2.0 * rr * rr - 1.0) * pup,
+        ],
+        axis=0,
+    ).astype(np.float32)  # FITS (nmodes, nwf, nwf) -> NAXIS1=nwf, NAXIS2=nwf, NAXIS3=nmodes
+
+    og = np.array([0.70, 0.70, 0.80], dtype=np.float32)
+    true_coeff = rng.normal(0.0, [0.18, 0.15, 0.22], size=(nt, nmodes)).astype(np.float32)
+    meas_mval = (true_coeff * og[None, :]).astype(np.float32)
+
+    # Reference monochromatic MFT PSF in Python
+    dpix = 0.9375 * nwf
+    f0 = float(ncam // 2)
+    eta = (np.arange(ncam, dtype=np.float64) - f0) / pixscale_ld
+    yt = (np.arange(nwf, dtype=np.float64) - ctr) / dpix
+    nrm = 1.0 / np.sqrt(np.sum(pup))
+    U = nrm * np.exp(-2j * np.pi * np.outer(eta, yt))
+    V = nrm * np.exp(-2j * np.pi * np.outer(yt, eta))
+
+    psf_true = np.zeros((ncam, ncam), dtype=np.float64)
+    for k in range(nt):
+        opd = 2.0 * (
+            true_coeff[k, 0] * modes[0]
+            + true_coeff[k, 1] * modes[1]
+            + true_coeff[k, 2] * modes[2]
+        )
+        epup = pup * np.exp(1j * (2.0 * np.pi / lam0) * opd)
+        efoc = U @ epup @ V
+        psf_true += np.abs(efoc) ** 2 / nt
+
+    sdir = tmp_path / "psfr_in"
+    odir = tmp_path / "psfr_out"
+    t = np.arange(nt, dtype=np.float64) / 1000.0
+    write_synthetic_cube(sdir, "aol2_modevalWFS", meas_mval[:, None, :], t, 1000.0)
+    fits.writeto(sdir / "CMmodesDM.fits", modes, overwrite=True)
+    fits.writeto(sdir / "pup.fits", pup, overwrite=True)
+    fits.writeto(sdir / "ogain.fits", og[None, :], overwrite=True)
+    fits.writeto(sdir / "psf_ref.fits", psf_true.astype(np.float32), overwrite=True)
+
+    wrapper = MILK_INSTALLDIR / "bin" / "milk-mlt-psfrecon"
+    res = subprocess.run(
+        [
+            str(wrapper),
+            str(sdir),
+            str(sdir / "CMmodesDM.fits"),
+            str(odir),
+            "aol2_modevalWFS",
+            "short_exp",
+            str(lam0),
+            "0.0",
+            "1",
+            str(pixscale_ld),
+            str(nwf),
+            str(ncam),
+            "8.2",
+            "0.9375",
+            "0.30",
+            "0.9375",
+            "0.15",
+            "2.0",
+            "0.0",
+            str(sdir / "pup.fits"),
+            "",
+            str(sdir / "ogain.fits"),
+            str(sdir / "psf_ref.fits"),
+            "1",
+            "0",
+        ],
+        env=milk_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+
+    kv = parse_kv(odir / "psfrecon_summary.txt")
+    assert float(kv["sr_abs_err"]) < 0.008, f"Strehl error too large: {kv}"
+    assert float(kv["corr_2d"]) > 0.999, f"2D correlation too low: {kv}"

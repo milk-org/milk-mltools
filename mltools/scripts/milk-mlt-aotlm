@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "run full AO telemetry health, modal optimization, and PSF reconstruction report"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Index captured closed-loop telemetry cubes, optimize dual-stage modal gains, reconstruct Vis/NIR PSFs, and emit TELEMETRY_REPORT.md."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-aotlm <telemetry_dir> [outdir] [decim_psf]
+   or: milk-mlt-aotlm .tlmdir=<telemetry_dir> [.outdir=<dir>] [.decim_psf=4]
+
+Run end-to-end closed-loop AO telemetry & PSF reconstruction analysis via mlt.aotlm.
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.aotlm -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.aotlm ${_q}"

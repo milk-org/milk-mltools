@@ -16,12 +16,16 @@
 /* CFITSIO-mandated runnables are weak so builds without CFITSIO still load the module. */
 MILK_RUNNABLE_WEAK_DECL(runnable_mlt_tlmload);
 MILK_RUNNABLE_WEAK_DECL(runnable_mlt_tlmsave);
+MILK_RUNNABLE_WEAK_DECL(runnable_mlt_aoopt);
+MILK_RUNNABLE_WEAK_DECL(runnable_mlt_psfrecon);
 
 static const MILK_RUNNABLE *const runnables[] = {
     &runnable_mlt_tlmindex,
     &runnable_mlt_tlmload,
     &runnable_mlt_tlmsync,
     &runnable_mlt_tlmsave,
+    &runnable_mlt_aoopt,
+    &runnable_mlt_psfrecon,
 };
 
 MILK_MODULE_RUNNABLES(milkmltools, NULL, runnables);
