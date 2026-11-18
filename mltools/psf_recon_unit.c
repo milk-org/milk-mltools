@@ -648,8 +648,22 @@ static errno_t psfrecon_run(void)
         openblas_set_num_threads(1);
     }
 
-    const uint32_t blk_sz = 64u;
-    float *opd_blk = (float *) malloc((size_t) n_act * blk_sz * sizeof(float));
+    int max_th = omp_get_max_threads();
+    int nth    = (max_th > 32) ? 32 : ((max_th > 0) ? max_th : 1);
+    if (nt_used > 0u && (uint32_t) nth > nt_used)
+    {
+        nth = (int) nt_used;
+    }
+
+    const uint32_t blk_sz  = 256u;
+    const size_t   tfloats = (size_t) ncam * nwf * 2u;
+    float  *opd_blk  = (float *) malloc((size_t) n_act * blk_sz * sizeof(float));
+    float  *epup_all = use_otf_only ? NULL : (float *) calloc((size_t) nth * npix_wf * 2u, sizeof(float));
+    float  *tmp_all  = use_otf_only ? NULL : (float *) malloc((size_t) nth * tfloats * sizeof(float));
+    float  *efoc_all = use_otf_only ? NULL : (float *) malloc((size_t) nth * npix_cam * 2u * sizeof(float));
+    double *psf_thr  = use_otf_only ? NULL : (double *) calloc((size_t) nth * npix_cam, sizeof(double));
+    double *s1_thr   = (double *) calloc((size_t) nth * n_act, sizeof(double));
+    double *s2_thr   = (double *) calloc((size_t) nth * n_act, sizeof(double));
 
     for (uint32_t b0 = 0; b0 < nt_used; b0 += blk_sz)
     {
@@ -658,10 +672,10 @@ static errno_t psfrecon_run(void)
         /* Batch OPD synthesis: opd_blk[n_act, nb] = u_act[n_act, nmodes] * r_mat[:, b0..b0+nb] */
 #ifdef HAVE_BLAS
         uint32_t p_chunk;
-#    pragma omp parallel for schedule(static)
-        for (p_chunk = 0; p_chunk < n_act; p_chunk += 1024u)
+#    pragma omp parallel for num_threads(nth) schedule(static)
+        for (p_chunk = 0; p_chunk < n_act; p_chunk += 512u)
         {
-            uint32_t rows = (p_chunk + 1024u <= n_act) ? 1024u : (n_act - p_chunk);
+            uint32_t rows = (p_chunk + 512u <= n_act) ? 512u : (n_act - p_chunk);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) rows, (int) nb,
                         (int) nmodes, 1.0f, &u_act[(size_t) p_chunk * nmodes], (int) nmodes,
                         &r_mat[b0], (int) nt_used, 0.0f, &opd_blk[(size_t) p_chunk * nb],
@@ -669,7 +683,7 @@ static errno_t psfrecon_run(void)
         }
 #else
         uint32_t p_i;
-#    pragma omp parallel for schedule(static)
+#    pragma omp parallel for num_threads(nth) schedule(static)
         for (p_i = 0; p_i < n_act; p_i++)
         {
             const float *urow = &u_act[(size_t) p_i * nmodes];
@@ -688,15 +702,15 @@ static errno_t psfrecon_run(void)
 #endif
 
         /* Accumulate piston-removed spatial variance & optional MFT short exposures */
-#pragma omp parallel reduction(+ : sum_svar)
+#pragma omp parallel num_threads(nth) reduction(+ : sum_svar)
         {
-            size_t  tbytes = (size_t) ncam * nwf * 2u * sizeof(float);
-            float  *epup   = use_otf_only ? NULL : (float *) calloc(npix_wf * 2u, sizeof(float));
-            float  *tmp    = use_otf_only ? NULL : (float *) malloc(tbytes);
-            float  *efoc = use_otf_only ? NULL : (float *) malloc(npix_cam * 2u * sizeof(float));
-            double *l_psf = use_otf_only ? NULL : (double *) calloc(npix_cam, sizeof(double));
-            double *l_s1  = (double *) calloc(n_act, sizeof(double));
-            double *l_s2  = (double *) calloc(n_act, sizeof(double));
+            int     tid   = omp_get_thread_num();
+            float  *epup  = use_otf_only ? NULL : &epup_all[(size_t) tid * npix_wf * 2u];
+            float  *tmp   = use_otf_only ? NULL : &tmp_all[(size_t) tid * tfloats];
+            float  *efoc  = use_otf_only ? NULL : &efoc_all[(size_t) tid * npix_cam * 2u];
+            double *l_psf = use_otf_only ? NULL : &psf_thr[(size_t) tid * npix_cam];
+            double *l_s1  = &s1_thr[(size_t) tid * n_act];
+            double *l_s2  = &s2_thr[(size_t) tid * n_act];
 
             uint32_t k;
 #pragma omp for schedule(static)
@@ -752,31 +766,48 @@ static errno_t psfrecon_run(void)
                     }
                 }
             }
-
-#pragma omp critical
-            {
-                for (uint32_t p = 0; p < n_act; p++)
-                {
-                    sum_opd[p] += l_s1[p];
-                    sum2_opd[p] += l_s2[p];
-                }
-                if (!use_otf_only)
-                {
-                    for (size_t i = 0; i < npix_cam; i++)
-                    {
-                        psf_ctrl[i] += (float) (l_psf[i] / (double) nt_used);
-                    }
-                }
-            }
-
-            free(epup);
-            free(tmp);
-            free(efoc);
-            free(l_psf);
-            free(l_s1);
-            free(l_s2);
         }
     }
+
+    /* Parallel reduction across persistent worker accumulators (zero critical-section locks) */
+#pragma omp parallel num_threads(nth)
+    {
+        uint32_t p;
+#pragma omp for schedule(static)
+        for (p = 0; p < n_act; p++)
+        {
+            double s1 = 0.0, s2 = 0.0;
+            for (int t = 0; t < nth; t++)
+            {
+                s1 += s1_thr[(size_t) t * n_act + p];
+                s2 += s2_thr[(size_t) t * n_act + p];
+            }
+            sum_opd[p]  = s1;
+            sum2_opd[p] = s2;
+        }
+        if (!use_otf_only && nt_used > 0u)
+        {
+            double inv_nt = 1.0 / (double) nt_used;
+            size_t i;
+#pragma omp for schedule(static)
+            for (i = 0; i < npix_cam; i++)
+            {
+                double acc = 0.0;
+                for (int t = 0; t < nth; t++)
+                {
+                    acc += psf_thr[(size_t) t * npix_cam + i];
+                }
+                psf_ctrl[i] += (float) (acc * inv_nt);
+            }
+        }
+    }
+
+    free(epup_all);
+    free(tmp_all);
+    free(efoc_all);
+    free(psf_thr);
+    free(s1_thr);
+    free(s2_thr);
 
     for (uint32_t p = 0; p < n_act; p++)
     {
