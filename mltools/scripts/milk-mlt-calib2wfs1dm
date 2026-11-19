@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+set -euo pipefail
+
+case "${1-}" in
+    -h1|--help-oneline)
+        echo "calibrate Mab, Mdb & virtual Mda_virt from 2-WFS + 1-DM closed-loop telemetry"
+        exit 0
+        ;;
+    -h2|--help-description)
+        echo "Synchronize two WFS streams (A, B) and an inter-stage DM stream (D), apply a shared causal AR(p) whitening filter W(z), and solve B = Mab A + Mdb D + b0 and virtual upstream A = Mba B - Mda_virt D + a0."
+        exit 0
+        ;;
+    -h|--help|-hm|--help-mono)
+        cat <<'EOF'
+Usage: milk-mlt-calib2wfs1dm <tlmdir> <outdir> [stream_a] [stream_b] [stream_d] [options...]
+   or: milk-mlt-calib2wfs1dm .tlmdir=<dir> .outdir=<out> [.whiten_order=4] ...
+
+Calibrate 2-WFS + 1-DM linear response matrices via mlt.calib2wfs1dm (mlt.sysid).
+EOF
+        command -v milk-cli >/dev/null 2>&1 && MILK_QUIET=1 milk-cli -q -c "mlt.calib2wfs1dm -h" || true
+        exit 0
+        ;;
+esac
+
+_q=""
+printf -v _q '%q ' "$@"
+MILK_QUIET=1 exec milk-cli -q -e -o -c "mlt.calib2wfs1dm ${_q}"

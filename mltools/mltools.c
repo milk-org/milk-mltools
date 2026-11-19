@@ -18,6 +18,7 @@ MILK_RUNNABLE_WEAK_DECL(runnable_mlt_tlmload);
 MILK_RUNNABLE_WEAK_DECL(runnable_mlt_tlmsave);
 MILK_RUNNABLE_WEAK_DECL(runnable_mlt_aoopt);
 MILK_RUNNABLE_WEAK_DECL(runnable_mlt_psfrecon);
+MILK_RUNNABLE_WEAK_DECL(runnable_mlt_sysid);
 
 static const MILK_RUNNABLE *const runnables[] = {
     &runnable_mlt_tlmindex,
@@ -26,6 +27,7 @@ static const MILK_RUNNABLE *const runnables[] = {
     &runnable_mlt_tlmsave,
     &runnable_mlt_aoopt,
     &runnable_mlt_psfrecon,
+    &runnable_mlt_sysid,
 };
 
 MILK_MODULE_RUNNABLES(milkmltools, NULL, runnables);

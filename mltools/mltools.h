@@ -19,5 +19,6 @@ extern const MILK_RUNNABLE runnable_mlt_tlmsync;
 extern const MILK_RUNNABLE runnable_mlt_tlmsave;
 extern const MILK_RUNNABLE runnable_mlt_aoopt;
 extern const MILK_RUNNABLE runnable_mlt_psfrecon;
+extern const MILK_RUNNABLE runnable_mlt_sysid;
 
 #endif /* MILK_MLTOOLS_H */

@@ -576,3 +576,156 @@ def test_psfrecon_strehl_and_profile(tmp_path, milk_env):
     kv = parse_kv(odir / "psfrecon_summary.txt")
     assert float(kv["sr_abs_err"]) < 0.008, f"Strehl error too large: {kv}"
     assert float(kv["corr_2d"]) > 0.999, f"2D correlation too low: {kv}"
+
+
+def test_arfit_firfilt_and_expint_sync(milk_env):
+    """Verify mlt_arfit + mlt_firfilt match numpy and mlt.tlmsync expint integrates ZOH exact."""
+    rng = np.random.default_rng(123)
+    n, k = 1500, 6
+    x = np.zeros((n, k), dtype=np.float64)
+    for t in range(2, n):
+        x[t] = 1.15 * x[t - 1] - 0.30 * x[t - 2] + rng.normal(0.0, 0.25, size=k)
+    y = 0.7 * x + rng.normal(0.0, 0.05, size=(n, k))
+
+    # MILK FPS string parameters are capped at 63 chars; keep paths short under /tmp.
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="m_") as short_dir:
+        base = Path(short_dir)
+        f_x = base / "x.fits"
+        f_y = base / "y.fits"
+        f_taps = base / "h.fits"
+        f_xw = base / "xw.fits"
+        f_yw = base / "yw.fits"
+        fits.writeto(f_x, x.astype(np.float32), overwrite=True)
+        fits.writeto(f_y, y.astype(np.float32), overwrite=True)
+
+        run_milk(
+            f'iofits.loadfits "{f_x}" _tx 2; '
+            f'iofits.loadfits "{f_y}" _ty 2; '
+            '@calc "_h = mlt_arfit(_tx, order=4, ridge=1e-4, normch=1); '
+            '_xw = mlt_firfilt(_tx, _h, demean=1); '
+            '_yw = mlt_firfilt(_ty, _h, demean=1);"; '
+            f'iofits.saveFITS _h "{f_taps}"; '
+            f'iofits.saveFITS _xw "{f_xw}"; '
+            f'iofits.saveFITS _yw "{f_yw}"',
+            milk_env,
+        )
+        taps = fits.getdata(f_taps).astype(np.float64).ravel()
+        xw = fits.getdata(f_xw).astype(np.float64)
+        yw = fits.getdata(f_yw).astype(np.float64)
+        assert taps.shape == (5,)
+        assert abs(taps[0] - 1.0) < 1e-6
+        assert np.all(xw[:4] == 0.0)
+        # Linear relation y = 0.7 x + noise must survive shared FIR filtering without bias
+        slope = np.sum(xw[4:] * yw[4:]) / np.sum(xw[4:] ** 2)
+        assert abs(slope - 0.7) < 0.015, f"Shared FIR slope distorted: {slope}"
+        # Output should be strongly whitened (lag-1 autocorr << raw ~0.92)
+        ac1_raw = np.corrcoef(x[1:, 0], x[:-1, 0])[0, 1]
+        ac1_w = np.corrcoef(xw[5:, 0], xw[4:-1, 0])[0, 1]
+        assert ac1_raw > 0.85 and abs(ac1_w) < 0.08, f"ac1_raw={ac1_raw}, ac1_w={ac1_w}"
+
+        # Verify expint piecewise-constant ZOH integration on a step change at t = 0.005 s
+        sdir = base / "ei"
+        t_b = np.arange(20, dtype=np.float64) * 0.001  # 1 kHz ZOH source
+        vals_b = np.zeros((20, 1, 2), dtype=np.float32)
+        vals_b[5:, 0, 0] = 1.0  # step from 0 -> 1 at t = 0.005 s
+        vals_b[5:, 0, 1] = 2.0
+        t_a = np.arange(10, dtype=np.float64) * 0.002 + 0.0005  # 500 Hz ref, dt=2ms
+        vals_a = np.zeros((10, 1, 2), dtype=np.float32)
+        write_synthetic_cube(sdir, "refA", vals_a, t_a, 500.0)
+        write_synthetic_cube(sdir, "srcB", vals_b, t_b, 1000.0)
+        f_sync = base / "so.fits"
+        run_milk(
+            f'mlt.tlmload .dir="{sdir}" .stream=refA .out=@L:_ra .packed=1; '
+            f'mlt.tlmload .dir="{sdir}" .stream=srcB .out=@L:_sb .packed=1; '
+            'mlt.tlmsync _ra_t _sb _sb_t @L:_so .lag=0.0 .mode=expint .texp=0.002; '
+            f'iofits.saveFITS _so "{f_sync}"',
+            milk_env,
+        )
+        so = fits.getdata(f_sync).astype(np.float64)
+        # At frame i=2, t_a=0.0045 s -> window [0.0035, 0.0055]: 1.5ms of 0 + 0.5ms of 1 -> 0.25!
+        assert abs(so[2, 0] - 0.25) < 1e-4, f"Expected 0.25, got {so[2, 0]}"
+        assert abs(so[2, 1] - 0.50) < 1e-4, f"Expected 0.50, got {so[2, 1]}"
+
+
+def test_sysid_and_calib2wfs1dm_closed_loop_recovery(tmp_path, milk_env):
+    """Verify mlt.sysid & mlt.calib2wfs1dm recover Mab, Mdb, b0, and virtual Mda_virt."""
+    rng = np.random.default_rng(77)
+    n = 3000
+    dA, dB, dD = 8, 6, 6
+    # True optical matrices: invertible-ish Mab (6x8), near-diagonal Mdb (6x6), static b0
+    Q_ab, _ = np.linalg.qr(rng.normal(size=(dA, dB)))
+    Mab_true = 0.85 * Q_ab.T  # (6 x 8)
+    og_true = np.array([0.82, 0.78, 0.74, 0.70, 0.68, 0.65], dtype=np.float64)
+    Mdb_true = np.diag(og_true) + 0.03 * rng.normal(size=(dB, dD))
+    b0_true = np.array([0.04, -0.03, 0.02, -0.015, 0.01, -0.02], dtype=np.float64)
+
+    # Simulate strongly autocorrelated turbulence A and closed-loop feedback D(t) with 2-frame lag
+    # B(t) = Mab * A(t) + Mdb * D(t - 2) + b0 + eps_B(t)
+    # D(t) = 0.97 * D(t - 1) - 0.35 * B(t) + dither(t)
+    A = np.zeros((n, dA), dtype=np.float64)
+    B = np.zeros((n, dB), dtype=np.float64)
+    D = np.zeros((n, dD), dtype=np.float64)
+    for t in range(2, n):
+        A[t] = 0.96 * A[t - 1] + rng.normal(0.0, 0.12, size=dA)
+        B[t] = (
+            A[t] @ Mab_true.T
+            + D[t - 2] @ Mdb_true.T
+            + b0_true
+            + rng.normal(0.0, 0.015, size=dB)
+        )
+        D[t] = 0.97 * D[t - 1] - 0.35 * (B[t] - b0_true) + rng.normal(0.0, 0.01, size=dD)
+
+    # Save telemetry cubes at 1000 Hz (A, B, D)
+    sdir = tmp_path / "sysid_tlm"
+    odir = tmp_path / "sysid_out"
+    t_sec = np.arange(n, dtype=np.float64) / 1000.0
+    write_synthetic_cube(sdir, "wfsA", A[:, None, :].astype(np.float32), t_sec, 1000.0)
+    write_synthetic_cube(sdir, "wfsB", B[:, None, :].astype(np.float32), t_sec, 1000.0)
+    write_synthetic_cube(sdir, "dmD", D[:, None, :].astype(np.float32), t_sec, 1000.0)
+
+    wrapper = MILK_INSTALLDIR / "bin" / "milk-mlt-calib2wfs1dm"
+    res = subprocess.run(
+        [
+            str(wrapper),
+            str(sdir),
+            str(odir),
+            "wfsA",
+            "wfsB",
+            "dmD",
+            str(dA),
+            str(dB),
+            str(dD),
+            "0.0",
+            "auto",
+            "4",
+            "0.01",
+            "0.70",
+        ],
+        env=milk_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert res.returncode == 0, f"stderr:\n{res.stderr}\nstdout:\n{res.stdout}"
+
+    kv = parse_kv(odir / "sysid_summary.txt")
+    # Auto lag scan must find exact 2.0-frame causal plant delay
+    assert abs(float(kv["lag_db_fr"]) - 2.0) <= 0.51, f"Wrong lag_db_fr: {kv}"
+    # AR whitening must dramatically increase conditional excitation eta_D
+    assert float(kv["eta_d_white"]) > float(kv["eta_d_raw"]) * 2.0, f"Whitening did not boost eta_D: {kv}"
+    assert float(kv["r2_b_w_med"]) > 0.90, f"Low whitened test R2: {kv}"
+    assert float(kv["r2_ol_raw_med"]) > 0.95, f"Low OL test R2: {kv}"
+
+    Mab_est = fits.getdata(odir / "Mab.fits").astype(np.float64)
+    Mdb_est = fits.getdata(odir / "Mdb.fits").astype(np.float64)
+    Mda_virt = fits.getdata(odir / "Mda_virt.fits").astype(np.float64)
+    b0_est = fits.getdata(odir / "b0.fits").astype(np.float64).ravel()
+
+    err_mdb = np.linalg.norm(Mdb_est - Mdb_true) / np.linalg.norm(Mdb_true)
+    err_mab = np.linalg.norm(Mab_est - Mab_true) / np.linalg.norm(Mab_true)
+    err_b0 = np.linalg.norm(b0_est - b0_true) / np.linalg.norm(b0_true)
+    err_cross = np.linalg.norm(Mab_est @ Mda_virt - Mdb_est) / np.linalg.norm(Mdb_est)
+    assert err_mdb < 0.05, f"Mdb relative error too large: {err_mdb:.4f}"
+    assert err_mab < 0.05, f"Mab relative error too large: {err_mab:.4f}"
+    assert err_b0 < 0.15, f"b0 relative error too large: {err_b0:.4f}"
+    assert err_cross < 0.12, f"Algebraic cross-check Mab*Mda_virt vs Mdb failed: {err_cross:.4f}"

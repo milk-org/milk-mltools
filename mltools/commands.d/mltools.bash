@@ -1672,7 +1672,8 @@ mlt.psfr() {
 mlt.aotlm() {
     @args 'tlmdir:str:telemetry directory containing cubes and telemetry_manifest.env' \
           'outdir:str=:output analysis directory (default <tlmdir>/analysis)' \
-          'decim_psf:int=4:temporal decimation for short-exposure PSFR (>=1)' -- "$@"
+          'decim_psf:int=4:temporal decimation for short-exposure PSFR (>=1)' \
+          'calib_2wfs1dm:int=0:run 2-WFS + 1-DM system identification (1=on, 0=off)' -- "$@"
 
     if [[ ! -d "${tlmdir}" ]]; then
         echo "mlt.aotlm: directory not found: ${tlmdir}" >&2
@@ -1804,6 +1805,331 @@ mlt.aotlm() {
         done
     fi
 
+    if (( calib_2wfs1dm )); then
+        local __c2d_out="${__out}/calib_2wfs1dm"
+        local __sc2="${TLM_PARENT_OUT}/selfRM_calib_stg2.fits"
+        local __ss2="${TLM_PARENT_OUT}/selfRM_onsky_stg2.fits"
+        [[ ! -f "${__sc2}" && -f "${TLM_STG2_CALIB}/selfRM_calib.fits" ]] && \
+            __sc2="${TLM_STG2_CALIB}/selfRM_calib.fits"
+        [[ ! -f "${__sc2}" ]] && __sc2=""
+        [[ ! -f "${__ss2}" ]] && __ss2=""
+        if mlt.calib2wfs1dm "${tlmdir}" "${__c2d_out}" \
+            "aol1_modevalWFS" "aol2_modevalWFS" "aol2_modevalDM" \
+            60 40 40 auto auto 4 0.02 0.70 "${__sc2}" "${__ss2}"; then
+            local -A __ck=()
+            __mlt_read_kv "${__c2d_out}/sysid_summary.txt" __ck
+            {
+                echo ""
+                echo "## 4. Two-WFS + Inter-Stage DM Calibration (\`mlt.sysid\`)"
+                echo ""
+                echo "| Metric | Unwhitened | AR(${__ck[whiten_order]:-4})-Whitened \`W(z)\` |"
+                echo "| :--- | ---: | ---: |"
+                printf '| Conditional DM Excitation `eta_D` | %s | **%s** |\n' \
+                    "${__ck[eta_d_raw]:-0}" "${__ck[eta_d_white]:-0}"
+                printf '| Recovered `diag(Mdb)` Median | %s | **%s** (IQR %s, off-diag %s) |\n' \
+                    "${__ck[mdb_diag_raw]:-0}" "${__ck[mdb_diag_med]:-0}" \
+                    "${__ck[mdb_diag_iqr]:-0}" "${__ck[mdb_offdiag]:-0}"
+                printf '| Held-Out `R^2` (`B_w` / `OL` / Virtual `A`) | &mdash; | `%s` / `%s` / `%s` |\n' \
+                    "${__ck[r2_b_w_med]:-0}" "${__ck[r2_ol_raw_med]:-0}" "${__ck[r2_a_raw_med]:-0}"
+                if [[ "${__ck[has_selfrm]:-0}" == "1" ]]; then
+                    printf '| Active `selfRM` Optical Gain Cross-Check | %s | Rel. Err `%s` |\n' \
+                        "${__ck[selfrm_og_med]:-0}" "${__ck[selfrm_err]:-0}"
+                fi
+            } >> "${__rep}"
+        fi
+    fi
+
     echo "mlt.aotlm: report written -> ${__rep}"
     return 0
+}
+
+# Calibrate Mab, Mdb & virtual upstream Mda_virt from 2-WFS + inter-stage DM telemetry
+mlt.calib2wfs1dm() {
+    @args 'tlmdir:str:telemetry directory for stream A (and B, D if dirb/dird empty)' \
+          'outdir:str:output directory for calibrated matrices and diagnostics' \
+          'stream_a:str=aol1_modevalWFS:upstream WFS A stream prefix' \
+          'stream_b:str=aol2_modevalWFS:downstream WFS B stream prefix' \
+          'stream_d:str=aol2_modevalDM:inter-stage DM D stream prefix' \
+          'max_modes_a:int=60:max leading channels of A (0=all)' \
+          'max_modes_b:int=40:max leading channels of B (0=all)' \
+          'max_modes_d:int=40:max leading channels of D (0=all)' \
+          'lag_ab_fr:str=auto:A->B lag in B-frames (or auto)' \
+          'lag_db_fr:str=auto:D->B causal plant lag in B-frames (or auto)' \
+          'whiten_order:int=4:causal AR(p) whitening order W(z) (0=off)' \
+          'whiten_ridge:float=0.02:AR(p) autocorrelation ridge' \
+          'train_frac:float=0.70:contiguous training split fraction' \
+          'selfrm_cal:str=:optional calibration selfRM cube [M,M,Z]' \
+          'selfrm_sky:str=:optional on-sky selfRM cube [M,M,Z]' \
+          'dirb:str=:optional separate directory for stream B' \
+          'dird:str=:optional separate directory for stream D' \
+          'tstart:str=:optional start time bound' \
+          'tend:str=:optional end time bound' \
+          'maxframes:int=0:maximum frames from reference stream (0=all)' \
+          'tsrc:str=auto:timestamp source (auto|acq|log)' -- "$@"
+
+    mkdir -p "${outdir}" || return 1
+    local -a __links=()
+    local __da="${tlmdir}" __db="${dirb:-${tlmdir}}" __dd="${dird:-${tlmdir}}"
+    local __sda __sdb __sdd __sout __srep __s_cal="" __s_sky=""
+    __mlt_short_path __sda "${__da}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_path __sdb "${__db}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_path __sdd "${__dd}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_path __sout "${outdir}" __links || { __mlt_cleanup __links; return 1; }
+    __mlt_short_outpath __srep "${outdir}/sysid_summary.txt" __links || {
+        __mlt_cleanup __links; return 1
+    }
+    [[ -n "${selfrm_cal}" && -f "${selfrm_cal}" ]] && \
+        __mlt_short_path __s_cal "${selfrm_cal}" __links
+    [[ -n "${selfrm_sky}" && -f "${selfrm_sky}" ]] && \
+        __mlt_short_path __s_sky "${selfrm_sky}" __links
+
+    local __use_ts="${tstart}" __use_te="${tend}"
+    if [[ -z "${__use_ts}" && -z "${__use_te}" ]]; then
+        local -A __ka_idx=() __kb_idx=() __kd_idx=()
+        __mlt_run_tlmindex "${__da}" "${stream_a}" __ka_idx || { __mlt_cleanup __links; return 1; }
+        __mlt_run_tlmindex "${__db}" "${stream_b}" __kb_idx || { __mlt_cleanup __links; return 1; }
+        __mlt_run_tlmindex "${__dd}" "${stream_d}" __kd_idx || { __mlt_cleanup __links; return 1; }
+        local __ov_s=0 __ov0=0 __ov1=0
+        @calc -v __ov_s,__ov0,__ov1 \
+            "_epb = f64(${__kb_idx[epoch_sec]}) - f64(${__ka_idx[epoch_sec]}); \
+             _epd = f64(${__kd_idx[epoch_sec]}) - f64(${__ka_idx[epoch_sec]}); \
+             _a0 = f64(${__ka_idx[tstart_rel]}); _a1 = f64(${__ka_idx[tend_rel]}); \
+             _b0 = f64(${__kb_idx[tstart_rel]}) + _epb; _b1 = f64(${__kb_idx[tend_rel]}) + _epb; \
+             _d0 = f64(${__kd_idx[tstart_rel]}) + _epd; _d1 = f64(${__kd_idx[tend_rel]}) + _epd; \
+             _o0 = max(_a0, max(_b0, _d0)); _o1 = min(_a1, min(_b1, _d1)); \
+             max(0.0, _o1 - _o0); _o0; _o1"
+        if (( $(@calc -v __ok "${__ov_s} > 0.0"; echo "${__ok}") == 0 )); then
+            echo "mlt.calib2wfs1dm: streams A, B, D have zero common overlapping span" >&2
+            __mlt_cleanup __links
+            return 1
+        fi
+        __use_ts="${__ov0}"
+        __use_te="${__ov1}"
+    fi
+
+    local -a __la=(".dir=${__sda}" ".stream=${stream_a}" ".out=@L:_mlt_cA" ".packed=1" ".tsrc=${tsrc}")
+    [[ -n "${__use_ts}" ]] && __la+=(".tstart=${__use_ts}")
+    [[ -n "${__use_te}" ]] && __la+=(".tend=${__use_te}")
+    (( maxframes > 0 )) && __la+=(".maxframes=${maxframes}")
+    mlt.tlmload "${__la[@]}" >/dev/null || { __mlt_cleanup __links; return 1; }
+
+    local __pa __na __ep_a __ta0 __ta1
+    @calc -v __pa,__na,__ep_a,__ta0,__ta1 \
+        "s._mlt_cA.xsize; s._mlt_cA.ysize; s._mlt_cA.kw.MLTEPOCH; \
+         _mlt_cA_t[0, 0]; _mlt_cA_t[0, s._mlt_cA.ysize - 1]"
+    __pa=${__pa%.*}
+    __na=${__na%.*}
+    __ep_a=${__ep_a%.*}
+
+    local __pad_t0 __pad_t1
+    @calc -v __pad_t0,__pad_t1 \
+        "f64(${__ep_a}) + f64(${__ta0}) - 0.15; f64(${__ep_a}) + f64(${__ta1}) + 0.15"
+
+    mlt.tlmload ".dir=${__sdb}" ".stream=${stream_b}" ".out=@L:_mlt_cB" ".packed=1" \
+        ".tsrc=${tsrc}" ".tstart=${__pad_t0}" ".tend=${__pad_t1}" >/dev/null || {
+        __mlt_rm_images _mlt_cA _mlt_cA_t; __mlt_cleanup __links; return 1
+    }
+    mlt.tlmload ".dir=${__sdd}" ".stream=${stream_d}" ".out=@L:_mlt_cD" ".packed=1" \
+        ".tsrc=${tsrc}" ".tstart=${__pad_t0}" ".tend=${__pad_t1}" >/dev/null || {
+        __mlt_rm_images _mlt_cA _mlt_cA_t _mlt_cB _mlt_cB_t; __mlt_cleanup __links; return 1
+    }
+
+    local __pb __nb __pd __nd
+    @calc -v __pb,__nb,__pd,__nd \
+        "s._mlt_cB.xsize; s._mlt_cB.ysize; s._mlt_cD.xsize; s._mlt_cD.ysize"
+    __pb=${__pb%.*}
+    __nb=${__nb%.*}
+    __pd=${__pd%.*}
+    __nd=${__nd%.*}
+
+    local __ka=${__pa} __kb=${__pb} __kd=${__pd}
+    (( max_modes_a > 0 && max_modes_a < __ka )) && __ka=${max_modes_a}
+    (( max_modes_b > 0 && max_modes_b < __kb )) && __kb=${max_modes_b}
+    (( max_modes_d > 0 && max_modes_d < __kd )) && __kd=${max_modes_d}
+
+    @calc "
+        _mlt_cAs = _mlt_cA[0:$(( __ka - 1 )), *];
+        _mlt_cBs = _mlt_cB[0:$(( __kb - 1 )), *];
+        _mlt_cDs = _mlt_cD[0:$(( __kd - 1 )), *];
+    " || {
+        __mlt_rm_images _mlt_cA _mlt_cA_t _mlt_cB _mlt_cB_t _mlt_cD _mlt_cD_t
+        __mlt_cleanup __links
+        return 1
+    }
+    __mlt_rm_images _mlt_cA _mlt_cB _mlt_cD
+
+    local __dta __dtb __dtd __fps_a __fps_b __ref_is_a=0
+    @calc -v __dta,__dtb,__dtd,__fps_a,__fps_b,__ref_is_a "
+        _dta = imedian(_mlt_cA_t[0, 1:$(( __na - 1 ))] - _mlt_cA_t[0, 0:$(( __na - 2 ))]);
+        _dtb = imedian(_mlt_cB_t[0, 1:$(( __nb - 1 ))] - _mlt_cB_t[0, 0:$(( __nb - 2 ))]);
+        _dtd = imedian(_mlt_cD_t[0, 1:$(( __nd - 1 ))] - _mlt_cD_t[0, 0:$(( __nd - 2 ))]);
+        _fa = 1.0 / max(_dta, 1e-9);
+        _fb = 1.0 / max(_dtb, 1e-9);
+        _dta; _dtb; _dtd; _fa; _fb; (_fb > 1.25 * _fa) ? 1 : 0
+    "
+    __ref_is_a=${__ref_is_a%.*}
+
+    local __fs_ref="${__fps_b}"
+    (( __ref_is_a )) && __fs_ref="${__fps_a}"
+
+    # Helper to align (A, B, D) onto common reference timeline at (lag_ab_fr, lag_db_fr) [B-frames]
+    __mlt_sync_abd_pair() {
+        local __lab_fr="$1" __ldb_fr="$2"
+        local __lab_s __ldb_s __l_d_on_a
+        @calc -v __lab_s,__ldb_s,__l_d_on_a \
+            "_la = (${__lab_fr}) * (${__dtb}); _ld = (${__ldb_fr}) * (${__dtb}); \
+             _la; _ld; _la - _ld"
+        local __i0_1 __i1_1 __i0_2 __i1_2 __s0 __s1 __nv
+        if (( __ref_is_a )); then
+            mlt.tlmsync _mlt_cA_t _mlt_cBs _mlt_cB_t @L:_mlt_Bs0 \
+                ".lag=${__lab_s}" ".mode=window" >/dev/null || return 1
+            mlt.tlmsync _mlt_cA_t _mlt_cDs _mlt_cD_t @L:_mlt_Ds0 \
+                ".lag=${__l_d_on_a}" ".mode=expint" ".texp=${__dta}" >/dev/null || return 1
+            @calc -v __i0_1,__i1_1,__i0_2,__i1_2 \
+                "s._mlt_Bs0.kw.SYNCI0; s._mlt_Bs0.kw.SYNCI1; \
+                 s._mlt_Ds0.kw.SYNCI0; s._mlt_Ds0.kw.SYNCI1"
+            @calc -v __s0,__s1,__nv \
+                "_s0 = max(${__i0_1}, ${__i0_2}) + 2; _s1 = min(${__i1_1}, ${__i1_2}) - 2; \
+                 _s0; _s1; max(0, _s1 - _s0 + 1)"
+            __s0=${__s0%.*}; __s1=${__s1%.*}; __nv=${__nv%.*}
+            (( __nv < 32 )) && return 1
+            @calc "
+                _mlt_Aal = _mlt_cAs[*, ${__s0}:${__s1}];
+                _mlt_Bal = _mlt_Bs0[*, ${__s0}:${__s1}];
+                _mlt_Dal = _mlt_Ds0[*, ${__s0}:${__s1}];
+            " || return 1
+            __mlt_rm_images _mlt_Bs0 _mlt_Ds0
+        else
+            local __neg_ab __neg_db __mode_a="linear"
+            @calc -v __neg_ab,__neg_db "-(${__lab_s}); -(${__ldb_s})"
+            if (( $(@calc -v __r "${__fps_a} > 1.25 * ${__fps_b}"; echo "${__r}") )); then
+                __mode_a="window"
+            fi
+            mlt.tlmsync _mlt_cB_t _mlt_cAs _mlt_cA_t @L:_mlt_As0 \
+                ".lag=${__neg_ab}" ".mode=${__mode_a}" >/dev/null || return 1
+            mlt.tlmsync _mlt_cB_t _mlt_cDs _mlt_cD_t @L:_mlt_Ds0 \
+                ".lag=${__neg_db}" ".mode=expint" ".texp=${__dtb}" >/dev/null || return 1
+            @calc -v __i0_1,__i1_1,__i0_2,__i1_2 \
+                "s._mlt_As0.kw.SYNCI0; s._mlt_As0.kw.SYNCI1; \
+                 s._mlt_Ds0.kw.SYNCI0; s._mlt_Ds0.kw.SYNCI1"
+            @calc -v __s0,__s1,__nv \
+                "_s0 = max(${__i0_1}, ${__i0_2}) + 2; _s1 = min(${__i1_1}, ${__i1_2}) - 2; \
+                 _s0; _s1; max(0, _s1 - _s0 + 1)"
+            __s0=${__s0%.*}; __s1=${__s1%.*}; __nv=${__nv%.*}
+            (( __nv < 32 )) && return 1
+            @calc "
+                _mlt_Aal = _mlt_As0[*, ${__s0}:${__s1}];
+                _mlt_Bal = _mlt_cBs[*, ${__s0}:${__s1}];
+                _mlt_Dal = _mlt_Ds0[*, ${__s0}:${__s1}];
+            " || return 1
+            __mlt_rm_images _mlt_As0 _mlt_Ds0
+        fi
+        return 0
+    }
+
+    local __opt_ab="${lag_ab_fr}" __opt_db="${lag_db_fr}"
+    if [[ "${lag_ab_fr}" == "auto" || "${lag_db_fr}" == "auto" ]]; then
+        local __tmp_dir="/tmp/mlt_lscan_${BASHPID}_$((++__MLT_SEQ))"
+        local __tmp_rep="${__tmp_dir}/rep.txt"
+        mkdir -p "${__tmp_dir}" || return 1
+        local -a __ab_cands=("0.0")
+        local -a __db_cands=("1.0" "1.5" "2.0" "2.5" "3.0" "3.5")
+        [[ "${lag_ab_fr}" == "auto" ]] && __ab_cands=("-0.5" "0.0" "0.5")
+        [[ "${lag_ab_fr}" != "auto" ]] && __ab_cands=("${lag_ab_fr}")
+        [[ "${lag_db_fr}" != "auto" ]] && __db_cands=("${lag_db_fr}")
+
+        local __best_r2="-1e9" __cand_ab __cand_db
+        local __scan_a=$(( __ka < 32 ? __ka : 32 ))
+        local __scan_b=$(( __kb < 24 ? __kb : 24 ))
+        local __scan_d=$(( __kd < 24 ? __kd : 24 ))
+        {
+            printf '# lag_db_fr\tlag_ab_fr\tr2_b_w_med\tmdb_diag_med\tr2_a_raw_med\n'
+            for __cand_db in "${__db_cands[@]}"; do
+                for __cand_ab in "${__ab_cands[@]}"; do
+                    if __mlt_sync_abd_pair "${__cand_ab}" "${__cand_db}"; then
+                        if mlt.sysid ".a=_mlt_Aal" ".b=_mlt_Bal" ".d=_mlt_Dal" \
+                            ".outdir=${__tmp_dir}" ".outreport=${__tmp_rep}" \
+                            ".max_modes_a=${__scan_a}" ".max_modes_b=${__scan_b}" \
+                            ".max_modes_d=${__scan_d}" \
+                            ".whiten_order=${whiten_order}" ".whiten_ridge=${whiten_ridge}" \
+                            ".train_frac=${train_frac}" ".reg_a=0.01" ".reg_d=0.001" \
+                            >/dev/null 2>&1; then
+                            local -A __skv=()
+                            __mlt_read_kv "${__tmp_rep}" __skv
+                            local __r2v="${__skv[r2_b_w_med]:--1e9}"
+                            printf '%s\t%s\t%s\t%s\t%s\n' \
+                                "${__cand_db}" "${__cand_ab}" "${__r2v}" \
+                                "${__skv[mdb_diag_med]:-0}" "${__skv[r2_a_raw_med]:-0}"
+                            if (( $(@calc -v __b "(${__r2v}) > (${__best_r2})"; echo "${__b}") )); then
+                                __best_r2="${__r2v}"
+                                __opt_ab="${__cand_ab}"
+                                __opt_db="${__cand_db}"
+                            fi
+                        fi
+                        __mlt_rm_images _mlt_Aal _mlt_Bal _mlt_Dal
+                    fi
+                done
+            done
+        } > "${outdir}/lag_scan.txt"
+        rm -rf "${__tmp_dir}"
+        [[ "${__opt_ab}" == "auto" ]] && __opt_ab="0.0"
+        [[ "${__opt_db}" == "auto" ]] && __opt_db="2.5"
+    fi
+
+    if ! __mlt_sync_abd_pair "${__opt_ab}" "${__opt_db}"; then
+        echo "mlt.calib2wfs1dm: failed to synchronize A, B, D at lag_ab=${__opt_ab} lag_db=${__opt_db}" >&2
+        __mlt_rm_images _mlt_cAs _mlt_cBs _mlt_cDs _mlt_cA_t _mlt_cB_t _mlt_cD_t \
+            _mlt_Aal _mlt_Bal _mlt_Dal
+        __mlt_cleanup __links
+        return 1
+    fi
+
+    local __lag_ab_ms __lag_db_ms
+    @calc -v __lag_ab_ms,__lag_db_ms \
+        "(${__opt_ab}) * (${__dtb}) * 1000.0; (${__opt_db}) * (${__dtb}) * 1000.0"
+
+    local -a __scmd=(
+        mlt.sysid
+        ".a=_mlt_Aal"
+        ".b=_mlt_Bal"
+        ".d=_mlt_Dal"
+        ".outdir=${__sout}"
+        ".outreport=${__srep}"
+        ".max_modes_a=${__ka}"
+        ".max_modes_b=${__kb}"
+        ".max_modes_d=${__kd}"
+        ".whiten_order=${whiten_order}"
+        ".whiten_ridge=${whiten_ridge}"
+        ".train_frac=${train_frac}"
+        ".reg_a=-1.0"
+        ".reg_d=-1.0"
+        ".lag_ab_ms=${__lag_ab_ms}"
+        ".lag_db_ms=${__lag_db_ms}"
+        ".lag_ab_fr=${__opt_ab}"
+        ".lag_db_fr=${__opt_db}"
+        ".fs_hz=${__fs_ref}"
+    )
+    [[ -n "${__s_cal}" ]] && __scmd+=(".selfrm_cal=${__s_cal}")
+    [[ -n "${__s_sky}" ]] && __scmd+=(".selfrm_sky=${__s_sky}")
+
+    "${__scmd[@]}"
+    local __rc=$?
+
+    if (( __rc == 0 )) && [[ -f "${outdir}/sysid_summary.txt" ]]; then
+        {
+            echo "stream_a=${stream_a}"
+            echo "stream_b=${stream_b}"
+            echo "stream_d=${stream_d}"
+            echo "lag_ab_fr=${__opt_ab}"
+            echo "lag_db_fr=${__opt_db}"
+            echo "fps_a=${__fps_a}"
+            echo "fps_b=${__fps_b}"
+            echo "ref_timeline=$( (( __ref_is_a )) && echo A || echo B )"
+        } >> "${outdir}/sysid_summary.txt"
+    fi
+
+    __mlt_rm_images _mlt_cAs _mlt_cBs _mlt_cDs _mlt_cA_t _mlt_cB_t _mlt_cD_t \
+        _mlt_Aal _mlt_Bal _mlt_Dal _mlt_As0 _mlt_Bs0 _mlt_Ds0
+    __mlt_cleanup __links
+    return ${__rc}
 }

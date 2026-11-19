@@ -10,6 +10,8 @@
  *   - mlt_xcov(A, B, maxlag=50, norm=1)
  *   - Xw, Yw = mlt_arwhiten(X, Y, order=10, ridge=1e-5)
  *   - mlt_arfilt1(X, order=10, ridge=1e-5)
+ *   - taps = mlt_arfit(X, order=8, ridge=1e-4, normch=1)
+ *   - Xf = mlt_firfilt(X, taps, demean=1)
  *   - pos, val, fwhm = mlt_peak1d(curve, x0=0.0, dx=1.0)
  *   - mlt_mask(cube, mask)
  *   - mlt_unmask(mat, mask)
@@ -256,11 +258,12 @@ static void mlt_xcov_free(void *state)
  * 2. Shared causal AR(p) Levinson-Durbin whitening helpers
  * ========================================================================= */
 
-static void fit_pooled_ar(const IMAGE *imX,
-                          int          order,
-                          double       ridge,
-                          double      *a_out,
-                          double     **z_out)
+static void fit_pooled_ar_ex(const IMAGE *imX,
+                             int          order,
+                             double       ridge,
+                             int          normch,
+                             double      *a_out,
+                             double     **z_out)
 {
     uint32_t k = 0;
     size_t   n = 0;
@@ -318,7 +321,21 @@ static void fit_pooled_ar(const IMAGE *imX,
 
     for (uint32_t ci = 0; ci < k; ci++)
     {
-        const double *row = zbuf + (size_t) ci * n;
+        const double *row   = zbuf + (size_t) ci * n;
+        double        scale = 1.0;
+        if (normch)
+        {
+            double e0 = 0.0;
+            for (size_t t = 0; t < n; t++)
+            {
+                e0 += row[t] * row[t];
+            }
+            if (e0 <= 1e-24)
+            {
+                continue;
+            }
+            scale = 1.0 / e0;
+        }
         for (int m = 0; m <= p; m++)
         {
             double acc = 0.0;
@@ -326,7 +343,7 @@ static void fit_pooled_ar(const IMAGE *imX,
             {
                 acc += row[t] * row[t - (size_t) m];
             }
-            r[m] += acc;
+            r[m] += acc * scale;
         }
     }
 
@@ -373,6 +390,15 @@ static void fit_pooled_ar(const IMAGE *imX,
     free(a_cur);
     free(a_nxt);
     free(r);
+}
+
+static void fit_pooled_ar(const IMAGE *imX,
+                          int          order,
+                          double       ridge,
+                          double      *a_out,
+                          double     **z_out)
+{
+    fit_pooled_ar_ex(imX, order, ridge, 0, a_out, z_out);
 }
 
 static void apply_causal_ar_from_z(const double *zbuf,
@@ -941,6 +967,210 @@ static void mlt_unmask_free(void *state)
     (void) state;
 }
 
+/* =========================================================================
+ * 7. taps = mlt_arfit(X, order=8, ridge=1e-4, normch=1)
+ * ========================================================================= */
+
+#define MLT_ARFIT_PARAMS(M)                                                                    \
+    M(".order", order, FPTYPE_INT64, 8, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                \
+      "Causal AR whitening order (0..128)")                                                    \
+    M(".ridge", ridge, FPTYPE_FLOAT64, 1e-4, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,           \
+      "Diagonal ridge loading on normalized autocorrelation")                                  \
+    M(".normch", normch, FPTYPE_INT64, 1, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,              \
+      "1=unit-variance channel pooling, 0=raw variance pooling")
+
+#define MLT_ARFIT_PORTS(M)                                                                     \
+    M(IN, X, MILK_PORT_IMAGE, 0, "Reference matrix X (k, N) or 1D (N)")                        \
+    M(OUT, taps, MILK_PORT_IMAGE, 0, "1D causal FIR taps [1, -a_1, ..., -a_p]")
+
+MILK_CALC_OP_DECLARE(mlt_arfit, MLT_ARFIT_PARAMS, MLT_ARFIT_PORTS);
+
+static int mlt_arfit_init(milk_calc_op_ctx_t *ctx, const void *P, void **state)
+{
+    (void) state;
+    const struct mlt_arfit_par *par = (const struct mlt_arfit_par *) P;
+    const IMAGE                *imX = MILK_IN(ctx, X);
+    if (imX == NULL)
+    {
+        return -1;
+    }
+    int order = (int) par->order;
+    if (order < 0)
+    {
+        order = 0;
+    }
+    if (order > 128)
+    {
+        order = 128;
+    }
+    uint32_t kx = 0;
+    size_t   nx = 0;
+    get_mat_dims(imX, &kx, &nx);
+    if (nx < 2)
+    {
+        return -1;
+    }
+    int p = order;
+    if ((size_t) p >= nx / 2)
+    {
+        p = (int) (nx / 4);
+    }
+    milk_op_set_out_shape(ctx, taps, (uint32_t) (p + 1), 0);
+    return 0;
+}
+
+static int mlt_arfit_exec(milk_calc_op_ctx_t *ctx, const void *P, void *state)
+{
+    (void) state;
+    const struct mlt_arfit_par *par = (const struct mlt_arfit_par *) P;
+    const IMAGE                *imX = MILK_IN(ctx, X);
+    IMAGE                      *out = MILK_OUT(ctx, taps);
+    if (imX == NULL || out == NULL)
+    {
+        return -1;
+    }
+    int order = (int) par->order;
+    if (order < 0)
+    {
+        order = 0;
+    }
+    if (order > 128)
+    {
+        order = 128;
+    }
+    uint32_t kx = 0;
+    size_t   nx = 0;
+    get_mat_dims(imX, &kx, &nx);
+    int p = order;
+    if ((size_t) p >= nx / 2)
+    {
+        p = (int) (nx / 4);
+    }
+    if ((int) out->md[0].size[0] < p + 1)
+    {
+        p = (int) out->md[0].size[0] - 1;
+    }
+
+    double  a[129];
+    double *zX = NULL;
+    fit_pooled_ar_ex(imX, p, par->ridge, (par->normch != 0) ? 1 : 0, a, &zX);
+    free(zX);
+
+    out->array.F[0] = 1.0f;
+    for (int m = 1; m <= p; m++)
+    {
+        out->array.F[m] = (float) (-a[m]);
+    }
+    for (uint32_t m = (uint32_t) (p + 1); m < out->md[0].size[0]; m++)
+    {
+        out->array.F[m] = 0.0f;
+    }
+    return 0;
+}
+
+static void mlt_arfit_free(void *state)
+{
+    (void) state;
+}
+
+/* =========================================================================
+ * 8. Xf = mlt_firfilt(X, taps, demean=1)
+ * ========================================================================= */
+
+#define MLT_FIRFILT_PARAMS(M)                                                                  \
+    M(".demean", demean, FPTYPE_INT64, 1, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,              \
+      "1=subtract per-channel temporal mean before filtering, 0=raw")
+
+#define MLT_FIRFILT_PORTS(M)                                                                   \
+    M(IN, X, MILK_PORT_IMAGE, 0, "Input matrix X (k, N) or 1D (N)")                            \
+    M(IN, taps, MILK_PORT_IMAGE, 0, "1D causal FIR tap vector [h_0, h_1, ..., h_p]")           \
+    M(OUT, Xf, MILK_PORT_IMAGE, 0, "Filtered matrix Xf (burn-in t < len(taps)-1 zeroed)")
+
+MILK_CALC_OP_DECLARE(mlt_firfilt, MLT_FIRFILT_PARAMS, MLT_FIRFILT_PORTS);
+
+static int mlt_firfilt_init(milk_calc_op_ctx_t *ctx, const void *P, void **state)
+{
+    (void) P;
+    (void) state;
+    const IMAGE *imX = MILK_IN(ctx, X);
+    const IMAGE *imT = MILK_IN(ctx, taps);
+    if (imX == NULL || imT == NULL || imT->md[0].nelement == 0)
+    {
+        return -1;
+    }
+    if (imX->md[0].naxis == 1)
+    {
+        milk_op_set_out_shape(ctx, Xf, imX->md[0].size[0], 0);
+    }
+    else
+    {
+        milk_op_set_out_shape(ctx, Xf, imX->md[0].size[0], imX->md[0].size[1]);
+    }
+    return 0;
+}
+
+static int mlt_firfilt_exec(milk_calc_op_ctx_t *ctx, const void *P, void *state)
+{
+    (void) state;
+    const struct mlt_firfilt_par *par = (const struct mlt_firfilt_par *) P;
+    const IMAGE                  *imX = MILK_IN(ctx, X);
+    const IMAGE                  *imT = MILK_IN(ctx, taps);
+    IMAGE                        *out = MILK_OUT(ctx, Xf);
+    if (imX == NULL || imT == NULL || out == NULL || imT->md[0].nelement == 0)
+    {
+        return -1;
+    }
+
+    uint32_t     k      = 0;
+    size_t       n      = 0;
+    size_t       ntaps  = (size_t) imT->md[0].nelement;
+    size_t       p      = (ntaps > 0) ? (ntaps - 1) : 0;
+    const float *src    = imX->array.F;
+    const float *h      = imT->array.F;
+    float       *dst    = out->array.F;
+    int          demean = (par->demean != 0);
+    get_mat_dims(imX, &k, &n);
+
+    uint32_t c;
+#pragma omp parallel for schedule(static) if ((size_t) k * n > 16384)
+    for (c = 0; c < k; c++)
+    {
+        double mean = 0.0;
+        if (demean && n > 0)
+        {
+            double sum = 0.0;
+            for (size_t t = 0; t < n; t++)
+            {
+                sum += (double) src[t * (size_t) k + c];
+            }
+            mean = sum / (double) n;
+        }
+        for (size_t t = 0; t < n; t++)
+        {
+            if (t < p)
+            {
+                dst[t * (size_t) k + c] = 0.0f;
+            }
+            else
+            {
+                double acc = 0.0;
+                for (size_t m = 0; m < ntaps; m++)
+                {
+                    double xm = (double) src[(t - m) * (size_t) k + c] - mean;
+                    acc += (double) h[m] * xm;
+                }
+                dst[t * (size_t) k + c] = (float) acc;
+            }
+        }
+    }
+    return 0;
+}
+
+static void mlt_firfilt_free(void *state)
+{
+    (void) state;
+}
+
 MILK_CALC_EXT_EXPORT(MILK_CALC_REG_OP(mlt_xcov,
                                       mlt_xcov,
                                       mlt_xcov_init,
@@ -952,6 +1182,16 @@ MILK_CALC_EXT_EXPORT(MILK_CALC_REG_OP(mlt_xcov,
                                       mlt_arwhiten_exec,
                                       mlt_arwhiten_free),
                      MILK_CALC_REG_IMG(mlt_arfilt1, mlt_arfilt1_img, mlt_arfilt1),
+                     MILK_CALC_REG_OP(mlt_arfit,
+                                      mlt_arfit,
+                                      mlt_arfit_init,
+                                      mlt_arfit_exec,
+                                      mlt_arfit_free),
+                     MILK_CALC_REG_OP(mlt_firfilt,
+                                      mlt_firfilt,
+                                      mlt_firfilt_init,
+                                      mlt_firfilt_exec,
+                                      mlt_firfilt_free),
                      MILK_CALC_REG_OP(mlt_peak1d,
                                       mlt_peak1d,
                                       mlt_peak1d_init,

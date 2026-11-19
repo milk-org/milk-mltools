@@ -19,13 +19,15 @@ Built in three thin layers that maximize reuse of existing `milk` infrastructure
 |---|---|---|
 | C FPS (`mlt.*` / `milk-fpsexec-mlt-*`) | `mlt.tlmindex` | Scan paired FITS+`.txt` cubes; report drops, orphans, frame rate, jitter, UT span |
 | C FPS | `mlt.tlmload` | Multi-threaded CFITSIO loader with time slicing, ROI, binning, pupil mask, and `(6, N)` `DOUBLE` timing image `<out>_t` |
-| C FPS | `mlt.tlmsync` | Align stream B onto stream A timestamps at lag $\tau$ (`linear`, `zoh`, `nearest`, `window`) |
+| C FPS | `mlt.tlmsync` | Align stream B onto stream A timestamps at lag $\tau$ (`linear`, `zoh`, `nearest`, `window`, `expint`) |
 | C FPS | `mlt.tlmsave` | Write 2D `(P, N)` or 3D `(nx, ny, N)` image + `<in>_t` timing as `.fits` + 7-col `.txt` pair |
 | C FPS | `mlt.aoopt` | Closed-loop AO modal Welch PSDs, empirical ETFs, PyWFS optical gains, and stability-constrained optimal modal gains |
 | C FPS | `mlt.psfrecon` | Polychromatic AO PSF reconstruction (`hybrid`, `short_exp`, `otf`) from modal telemetry, DM modes, optical gains, and Kolmogorov fitting halos |
+| C FPS | `mlt.sysid` | Joint 2-WFS + 1-DM linear system ID (`B = Mab A + Mdb D + b0` & virtual upstream `A = Mba B - Mda_virt D + a0`) via shared AR($p$) whitening & CV |
 | `@calc` C op | `mlt_xcov` | Normalized subspace or raw cross-covariance across `[-maxlag, +maxlag]` |
 | `@calc` C op | `mlt_arwhiten` | Fit pooled causal AR($p$) Levinson-Durbin filter on `X` and whiten both `X` and `Y` identically |
 | `@calc` C op | `mlt_arfilt1` | Single-input causal AR($p$) whitening filter |
+| `@calc` C op | `mlt_arfit` / `mlt_firfilt` | Fit pooled causal AR($p$) FIR taps `W(z)` on `X` and apply the identical FIR filter to arbitrary streams |
 | `@calc` C op | `mlt_peak1d` | Parabolic sub-sample peak position, height, and FWHM on a 1D curve |
 | `@calc` C op | `mlt_mask` / `mlt_unmask` | Fast 3D-to-`(P, K)` mask gather and `(P, K)`-to-3D scatter |
 | Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.tlmcheck` / `milk-mlt-check` | Single- or two-stream health check and overlap duration summary |
@@ -37,7 +39,8 @@ Built in three thin layers that maximize reuse of existing `milk` infrastructure
 | Bash (`mlt.*`) | `mlt.psd` | Welch one-sided PSD and optional two-stream magnitude-squared coherence + cross-phase |
 | Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.aoloop` / `milk-mlt-aoopt` | Path-safe closed-loop modal PSD, optical gain, and optimal gain solver |
 | Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.psfr` / `milk-mlt-psfrecon` | Path-safe polychromatic PSF reconstruction and Strehl/profile benchmark |
-| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.aotlm` / `milk-mlt-aotlm` | End-to-end telemetry health, dual-stage AO optimization, and Vis/NIR PSFR report (`TELEMETRY_REPORT.md`) |
+| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.calib2wfs1dm` / `milk-mlt-calib2wfs1dm` | 3-stream multi-rate sync (`window` + `expint`), causal plant lag scan, and `mlt.sysid` (`Mab`, `Mdb`, `Mba`, `Mda_virt`) |
+| Bash (`mlt.*`) / OS CLI (`milk-mlt-*`) | `mlt.aotlm` / `milk-mlt-aotlm` | End-to-end telemetry health, dual-stage AO optimization, PSFR, and optional 2-WFS/1-DM calibration (`TELEMETRY_REPORT.md`) |
 
 ## Quickstart
 

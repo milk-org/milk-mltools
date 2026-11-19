@@ -22,6 +22,7 @@ static char   p_b[FUNCTION_PARAMETER_STRMAXLEN]    = "";
 static char   p_b_t[FUNCTION_PARAMETER_STRMAXLEN]  = "";
 static char   p_out[FUNCTION_PARAMETER_STRMAXLEN]  = "@L:bsync";
 static double p_lag                                = 0.0;
+static double p_texp                               = 0.0;
 static char   p_mode[FUNCTION_PARAMETER_STRMAXLEN] = "linear";
 
 static int64_t o_i0     = -1;
@@ -35,8 +36,10 @@ static int64_t o_nvalid = 0;
     X(".out", p_out, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT, "Output synced image")         \
     X(".lag", &p_lag, FPTYPE_FLOAT64, 0, FPFLAG_DEFAULT_INPUT,                                  \
       "Lag tau [s]: samples B at t_a + lag")                                                    \
+    X(".texp", &p_texp, FPTYPE_FLOAT64, 0, FPFLAG_DEFAULT_INPUT,                                \
+      "Exposure integration width [s] for expint mode (0=auto dt_A)")                           \
     X(".mode", p_mode, FPTYPE_STRING_NOT_STREAM, 0, FPFLAG_DEFAULT_INPUT,                       \
-      "Mode: linear|zoh|nearest|window")                                                        \
+      "Mode: linear|zoh|nearest|window|expint")                                                 \
     X(".i0", &o_i0, FPTYPE_INT64, 0, FPFLAG_DEFAULT_OUTPUT, "First valid A frame index")        \
     X(".i1", &o_i1, FPTYPE_INT64, 0, FPFLAG_DEFAULT_OUTPUT, "Last valid A frame index")         \
     X(".nvalid", &o_nvalid, FPTYPE_INT64, 0, FPFLAG_DEFAULT_OUTPUT, "Valid overlapping frames")
@@ -48,7 +51,8 @@ typedef enum
     MLT_SYNC_LINEAR  = 0,
     MLT_SYNC_ZOH     = 1,
     MLT_SYNC_NEAREST = 2,
-    MLT_SYNC_WINDOW  = 3
+    MLT_SYNC_WINDOW  = 3,
+    MLT_SYNC_EXPINT  = 4
 } mlt_sync_mode;
 
 static size_t lower_bound_double(const double *arr, size_t n, double val)
@@ -89,9 +93,14 @@ static errno_t tlmsync_run(void)
     {
         mode = MLT_SYNC_WINDOW;
     }
+    else if (strcmp(p_mode, "expint") == 0)
+    {
+        mode = MLT_SYNC_EXPINT;
+    }
     else
     {
-        fprintf(stderr, "ERROR: unknown sync mode '%s' (use linear|zoh|nearest|window)\n", p_mode);
+        fprintf(stderr, "ERROR: unknown sync mode '%s' (use linear|zoh|nearest|window|expint)\n",
+                p_mode);
         return RETURN_FAILURE;
     }
 
@@ -261,14 +270,16 @@ static errno_t tlmsync_run(void)
                 continue;
             }
 
-            if (mode == MLT_SYNC_WINDOW && na >= 2 && nb >= 2)
+            if ((mode == MLT_SYNC_WINDOW || mode == MLT_SYNC_EXPINT) && na >= 2 && nb >= 2)
             {
                 double t_c  = ta[i] + shift;
                 double d_lo = (i > 0) ? 0.5 * (ta[i] - ta[i - 1]) : 0.5 * (ta[1] - ta[0]);
                 double d_hi = (i + 1 < na) ? 0.5 * (ta[i + 1] - ta[i])
                                            : 0.5 * (ta[na - 1] - ta[na - 2]);
-                double w_lo = t_c - d_lo;
-                double w_hi = t_c + d_hi;
+                double w_lo = (mode == MLT_SYNC_EXPINT && p_texp > 0.0) ? (t_c - 0.5 * p_texp)
+                                                                        : (t_c - d_lo);
+                double w_hi = (mode == MLT_SYNC_EXPINT && p_texp > 0.0) ? (t_c + 0.5 * p_texp)
+                                                                        : (t_c + d_hi);
                 if (w_hi <= w_lo)
                 {
                     w_hi = w_lo + 1e-12;
@@ -283,10 +294,21 @@ static errno_t tlmsync_run(void)
                 double wsum = 0.0;
                 for (size_t k = kstart; k < nb; k++)
                 {
-                    double b_lo = (k > 0) ? 0.5 * (tb[k - 1] + tb[k])
-                                          : tb[0] - 0.5 * (tb[1] - tb[0]);
-                    double b_hi = (k + 1 < nb) ? 0.5 * (tb[k] + tb[k + 1])
-                                               : tb[nb - 1] + 0.5 * (tb[nb - 1] - tb[nb - 2]);
+                    double b_lo;
+                    double b_hi;
+                    if (mode == MLT_SYNC_EXPINT)
+                    {
+                        /* Piecewise-constant ZOH hold: sample k active on [tb[k], tb[k+1]). */
+                        b_lo = tb[k];
+                        b_hi = (k + 1 < nb) ? tb[k + 1] : (tb[nb - 1] + (tb[nb - 1] - tb[nb - 2]));
+                    }
+                    else
+                    {
+                        b_lo = (k > 0) ? 0.5 * (tb[k - 1] + tb[k])
+                                       : tb[0] - 0.5 * (tb[1] - tb[0]);
+                        b_hi = (k + 1 < nb) ? 0.5 * (tb[k] + tb[k + 1])
+                                            : tb[nb - 1] + 0.5 * (tb[nb - 1] - tb[nb - 2]);
+                    }
                     if (b_lo >= w_hi)
                     {
                         break;
@@ -314,6 +336,15 @@ static errno_t tlmsync_run(void)
                     {
                         dst[p] *= invw;
                     }
+                }
+                else
+                {
+                    size_t kk = lower_bound_double(tb, nb, t_c);
+                    if (kk > 0 && (kk >= nb || tb[kk] > t_c))
+                    {
+                        kk--;
+                    }
+                    memcpy(dst, b_arr + kk * pf, pf * sizeof(float));
                 }
                 continue;
             }
